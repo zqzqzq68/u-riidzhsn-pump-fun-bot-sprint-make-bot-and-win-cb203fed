@@ -13,8 +13,8 @@ Strategy (fully deterministic: no randomness, no clock, no environment):
   * BUY a young coin when its last 24 trades are buy-dominated (buy SOL share
     >= 60%) AND its price has risen >= 2% across that window, with a fixed
     0.15 SOL size clamped to the harness per-coin size cap.
-  * SELL a whole position when it gains >= 20%, loses >= 12%, falls >= 12%
-    from its peak since entry, ages past 2400 slots, or the curve completes.
+  * SELL a whole position when it gains >= 12%, loses >= 6%, falls >= 6%
+    from its peak since entry, ages past 1200 slots, or the curve completes.
   * At most max_open_positions open at once; never exceed the per-batch order
     cap; never trade a coin already held or with a buy pending.
 
@@ -35,10 +35,11 @@ MIN_BUY_SHARE = 0.60                   # buy SOL share across the window
 MIN_MOMENTUM = 0.02                    # price rise across the window
 MAX_AGE_SLOTS = 20000                  # only coins created within this many slots
 MAX_CHASE_MULTIPLE = 3.0               # never buy above 3x the first seen price
-TAKE_PROFIT = 0.20                     # sell at +20%
-STOP_LOSS = -0.12                      # sell at -12%
-TRAILING_DROP = 0.12                   # sell at -12% from the peak since entry
-MAX_HOLD_SLOTS = 2400                  # sell once a position is this old
+TAKE_PROFIT = 0.12                     # sell at +12%
+STOP_LOSS = -0.06                      # sell at -6%
+TRAILING_DROP = 0.06                   # sell at -6% from the peak since entry
+MAX_HOLD_SLOTS = 1200                  # sell once a position is this old
+REENTRY_COOLDOWN_SLOTS = 600           # wait this long after a sell to re-buy
 MAX_SLIPPAGE_BPS = 500
 
 
@@ -109,6 +110,8 @@ class Bot:
         self.positions = {}   # mint -> {"tokens": int, "cost": int}
         self.curves = {}      # mint -> Curve
         self.pending_buys = set()  # mints with a buy order awaiting its fill
+        self.pending_sells = set()  # mints with a sell order awaiting its fill
+        self.last_sell_slot = {}  # mint -> slot of the last sell sent
         self.next_client = 1
         self.batches_seen = 0
         self.buys_sent = 0
@@ -151,11 +154,13 @@ class Bot:
         self.cash = self.capital
 
     def apply_fills(self, fills):
-        # Every fill clears its mint's pending buy, whatever its status: the
-        # SDK pops pending for every fill, and a rejected buy left pending
-        # would block that mint (and count against the position cap) forever.
+        # Every fill clears its mint's pending buy AND pending sell, whatever
+        # its status: the SDK pops pending for every fill, and a rejected
+        # order left pending would block that mint (and count against the
+        # position cap) forever.
         for fill in fills or []:
             self.pending_buys.discard(fill.get("mint", ""))
+            self.pending_sells.discard(fill.get("mint", ""))
 
     def apply_account(self, account):
         self.cash = int(account["cash_lamports"])
@@ -174,11 +179,12 @@ class Bot:
             # so its exit rules (peak, age) can fire instead of stranding it.
             curve = self.curve_for(mint, self.slot)
             if mint not in self.positions:
-                if curve.entry_slot < 0:
-                    curve.entry_slot = self.slot
-                if curve.peak_since_entry <= 0.0 and curve.price > 0.0:
-                    curve.peak_since_entry = curve.price
-            if curve.price > curve.peak_since_entry:
+                # Fresh entry (not a re-appearance): reset the entry clock
+                # and peak, or an old entry_slot makes the age exit fire on
+                # the very next batch and churn buy->sell->buy forever.
+                curve.entry_slot = self.slot
+                curve.peak_since_entry = curve.price
+            elif curve.price > curve.peak_since_entry:
                 curve.peak_since_entry = curve.price
         self.positions = new_positions
 
@@ -236,24 +242,39 @@ class Bot:
 
     def exit_orders(self):
         orders = []
+
+        def sell(mint, pos):
+            orders.append(
+                {
+                    "side": "sell",
+                    "client_id": self.fresh_client_id(),
+                    "mint": mint,
+                    "token_amount": str(pos["tokens"]),
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }
+            )
+            # One sell in flight per mint, plus a re-entry cooldown: without
+            # both, a filled-then-rebought coin churns buy->sell->buy and a
+            # still-unfilled sell gets duplicated every batch.
+            self.pending_sells.add(mint)
+            self.last_sell_slot[mint] = self.slot
+
         for mint in sorted(self.positions):
             pos = self.positions[mint]
             curve = self.curves.get(mint)
             if curve is None:
                 continue
+            if mint in self.pending_sells:
+                # A sell is already in flight for this mint: the account
+                # still shows it until the fill lands, and re-selling the
+                # same tokens every batch only pays a tx fee per duplicate
+                # (a rejected duplicate still costs base + priority fee).
+                continue
             age = self.slot - curve.entry_slot if curve.entry_slot >= 0 else 0
             # Age and completion exits need no current price: a coin whose
             # curve went quiet must still be sold, never stranded.
             if age >= MAX_HOLD_SLOTS or curve.complete:
-                orders.append(
-                    {
-                        "side": "sell",
-                        "client_id": self.fresh_client_id(),
-                        "mint": mint,
-                        "token_amount": str(pos["tokens"]),
-                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                    }
-                )
+                sell(mint, pos)
                 continue
             if curve.price <= 0.0:
                 continue
@@ -265,15 +286,7 @@ class Bot:
                 else False
             )
             if gain >= TAKE_PROFIT or gain <= STOP_LOSS or trailing:
-                orders.append(
-                    {
-                        "side": "sell",
-                        "client_id": self.fresh_client_id(),
-                        "mint": mint,
-                        "token_amount": str(pos["tokens"]),
-                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                    }
-                )
+                sell(mint, pos)
         return orders
 
     def entry_orders(self, budget_orders):
@@ -283,6 +296,11 @@ class Bot:
             if curve.complete or curve.price <= 0.0:
                 continue
             if mint in self.positions or mint in self.pending_buys:
+                continue
+            if mint in self.pending_sells:
+                continue
+            last_sell = self.last_sell_slot.get(mint)
+            if last_sell is not None and self.slot - last_sell < REENTRY_COOLDOWN_SLOTS:
                 continue
             if self.slot - curve.created_slot > MAX_AGE_SLOTS:
                 continue
