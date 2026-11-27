@@ -9,8 +9,8 @@ A deterministic paper-trading bot for pump.fun bonding curves, built for make.fu
 ## Strategy
 
 - Track every bonding curve's price (virtual quote reserves / virtual token reserves) and its recent trade tape.
-- **Buy** a young coin when its last 24 trades are buy-dominated (buy SOL share >= 70%) and its price has risen >= 5% across that window. Fixed size 0.2 SOL per entry, clamped to the harness per-coin size cap (bps of real quote reserves), never below 0.02 SOL.
-- **Sell** a whole position at +30% take-profit, -12% stop-loss, -12% from its peak since entry (trailing stop), after 3600 slots held, or when the curve completes.
+- **Buy** a young coin when its last 24 trades are buy-dominated (buy SOL share >= 60%) and its price has risen >= 2% across that window. Fixed size 0.15 SOL per entry, clamped to the harness per-coin size cap (bps of real quote reserves), never below 0.01 SOL.
+- **Sell** a whole position at +12% take-profit, -6% stop-loss, -6% from its peak since entry (trailing stop), after 1200 slots held, or when the curve completes.
 - At most 5 open positions, at most 16 orders per batch, no shorts, no leverage.
 - Fully deterministic: no randomness, no clock, no environment reads, so two runs on the same data produce the same action log.
 
